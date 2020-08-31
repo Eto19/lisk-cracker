@@ -101,3 +101,5 @@ You should use values less than 20000 for normal usage.
 If it was useful please consider donating
 
 Donate XMR : `8BU6iGasRaTagSuCVD5EiyTz1osufL9oTar9VXAuWXkhAByJGfRMfNGjkN1s7JrJWwh7PWV2wbUohDgwvYVypZiE5sMBzGC`
+
+Twitter : @Eto19_
