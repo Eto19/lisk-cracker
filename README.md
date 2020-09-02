@@ -46,6 +46,8 @@ cuda 10.2 + pycuda + pynacl + python 3.7.0
 
   * `nvcc -V`
 
+* Download : https://github.com/Eto19/lisk-cracker/archive/master.zip
+
 ## Usage
 
 `python main.py --help`
