@@ -34,8 +34,10 @@ cuda 10.2 + pycuda + pynacl + python 3.7.0
 
 * Add anaconda3/python3/cuda to PATH
 
-* Install pycuda and pynacl :
-
+* Install numpy, pycuda and pynacl :
+  
+  * `pip install numpy`
+  
   * `pip install pycuda`
 
   * `pip install pynacl`
