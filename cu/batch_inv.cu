@@ -90,17 +90,4 @@ __global__ void calc_next_optimized_point(t256 *xmy, t256 *xpy, t256 *t, t512_ba
 
     mul_mod_2(f.u32, e.u32, f.u32);  // t = x * y
     copy(t[globalid].u32, f.u32);
-}  
-
-__global__ void test_batch_inv(t256 *w, t256 *out_test)
-{
-    t256 in, out;
-
-    const int gid = blockDim.x * blockIdx.x + threadIdx.x;
- 
-    copy(in.u32, w[gid].u32); 
-      
-    bn_mod_inverse(out.u32, in.u32);
-       
-    copy(w[gid].u32, out.u32);
 }

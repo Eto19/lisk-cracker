@@ -419,7 +419,6 @@ __global__ void bloom_filter_init(const uint32 *haystack, const uint32 *haystack
     }
 }
 
-
 __global__ void sha256_quad(const t256 *in, uint32 *temp, const t256 *inv_z, const uint8 *bloom_filter, const haystack2_t *haystack, const haystack2_t *haystack2, const haystack_t *full_haystack, int *found)
 {
     t256 xy, z_in;

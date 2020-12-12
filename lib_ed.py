@@ -2,19 +2,13 @@ import time
 import random
 import hashlib
 import operator
-import sys
 import binascii
 import os
 import math
-import itertools
 import secrets
 import csv
-import argparse
-import nacl.bindings
-import json
 
 indexbytes = operator.getitem
-intlist2bytes = bytes
 int2byte = operator.methodcaller("to_bytes", 1, "big")
 
 start_time = time.time()
@@ -26,12 +20,12 @@ l = 2 ** 252 + 27742317777372353535851937790883648493
 def H(m):
     return hashlib.sha512(m).digest()
 
-def egcd(a, b):
+def egcd(a, m):
     if a == 0:
-        return (b, 0, 1)
+        return (m, 0, 1)
     else:
-        g, y, x = egcd(b % a, a)
-        return (g, x - (b // a) * y, y)
+        g, y, x = egcd(m % a, a)
+        return (g, x - (m // a) * y, y)
 
 def modinv(a, m):
     g, x, y = egcd(a, m)
@@ -65,15 +59,15 @@ def edwards_add(P, Q):
     (x2, y2, z2, t2) = Q
 
     a = (y1-x1)*(y2-x2) % q
-    b = (y1+x1)*(y2+x2) % q
+    bb = (y1+x1)*(y2+x2) % q
 
     c = t1*2*d*t2 % q
     dd = z1*2*z2 % q
 
-    e = b - a
+    e = bb - a
     f = dd - c
     g = dd + c
-    h = b + a
+    h = bb + a
 
     x3 = e*f % q
     y3 = g*h % q
@@ -86,33 +80,23 @@ def edwards_double(P):
     (x1, y1, z1, t1) = P
 
     a = x1*x1 % q
-    b = y1*y1 % q
+    bb = y1*y1 % q
     c = 2*z1*z1 % q
 
     xyxy = (x1+y1)*(x1+y1) % q
     
-    d = -a % q
+    dd = -a % q
 
-    e = (xyxy + d - b) % q
-    g = (b - a) % q
+    e = (xyxy + dd - bb) % q
+    g = (bb - a) % q
     f = g - c
-    h = d - b
+    h = dd - bb
     x3 = e*f % q
     y3 = g*h % q
     t3 = e*h % q
     z3 = f*g % q
 
     return (x3, y3, z3, t3)
-
-
-def scalarmult(P, e):
-    if e == 0:
-        return ident
-    Q = scalarmult(P, e // 2)
-    Q = edwards_double(Q)
-    if e & 1:
-        Q = edwards_add(Q, P)
-    return Q
 
 Bpow = []
 
@@ -123,7 +107,6 @@ def make_Bpow():
         P = edwards_double(P)
 
 make_Bpow()
-
 
 def scalarmult_B(e):
     e = e % l
@@ -221,10 +204,6 @@ def Hint(m):
     return sum(2 ** i * bit(h, i) for i in range(2 * 256))
 
 def signature_unsafe(m, sk, pk):
-    """
-    Not safe to use with secret keys or secret data.
-    This function should be used for testing only.
-    """
     sk_int = hex_to_int(sk)
     r = (secrets.randbelow(2**200))
     R = scalarmult_B(r)
@@ -234,7 +213,7 @@ def signature_unsafe(m, sk, pk):
 def public_key_sha256_dual(pk):
     hashed = hashlib.sha256(pk).digest()
     addr1 = int.from_bytes(hashed[0:8], 'little')
-    pk[31] ^= 128;
+    pk[31] ^= 128
     hashed = hashlib.sha256(pk).digest()
     addr2 = int.from_bytes(hashed[0:8], 'little')
     
@@ -321,68 +300,25 @@ def privatetopublickey(pk):
 
     return [binascii.hexlify(encoded0), binascii.hexlify(encoded1), binascii.hexlify(encoded2), binascii.hexlify(encoded3), binascii.hexlify(encoded4), binascii.hexlify(encoded5), binascii.hexlify(encoded6), binascii.hexlify(encoded7)]
 
-import pycuda.compiler
-import pycuda.tools
-import pycuda.driver as drv
-
 def save_cubin(kernel, filename):
     file = open(filename,"wb") 
     file.write(kernel) 
     file.close() 
 
-def load_module_new(module_name, module_file, nvcc_options, nvcc_include_dirs, cubin_cache_enable):
-    cu_hexhash = hashlib.md5(bytearray(module_file, 'utf-8')).hexdigest()
-    cu_hexhash_from_file = ''
-
-    if not (os.path.exists("cubin_cache/"+str(module_name)+".txt")):
-        cache_file = open("cubin_cache/"+str(module_name)+".txt", 'w+')
-        cache_file.write(cu_hexhash)
-        cache_file.close() 
-    else:
-        cache_file = open("cubin_cache/"+str(module_name)+".txt", 'r')
-        cu_hexhash_from_file = cache_file.read()
-        cache_file.close() 
-
-    if (cu_hexhash_from_file == cu_hexhash) & (os.path.isfile("cubin/"+str(cu_hexhash_from_file)+"_cubin.cubin")) & cubin_cache_enable:
-        print("Load cached %s kernel !" % str(module_name))
-        return drv.module_from_file("cubin/"+str(cu_hexhash)+"_cubin.cubin")
-    else:
-        if (os.path.isfile("cubin/"+str(cu_hexhash_from_file)+"_cubin.cubin")):
-            os.remove("cubin/"+str(cu_hexhash_from_file)+"_cubin.cubin")
-
-    cache_file = open("cubin_cache/"+str(module_name)+".txt", 'w')
-    cache_file.write(cu_hexhash) 
-    cache_file.close() 
-
-    print("Caching %s kernel !" % str(module_name))
-
-    cubin = pycuda.compiler.compile(module_file, options=nvcc_options, include_dirs=nvcc_include_dirs, cache_dir=None)
-    save_cubin(cubin, "cubin/"+str(cu_hexhash)+"_cubin.cubin")
-
-    return drv.module_from_file("cubin/"+str(cu_hexhash)+"_cubin.cubin")
-
-
 def get_define(name, value, file):
     s = "\n"+"#define "+name.upper()+" "+str(value)+"\n"
     return str(s) + file
-
-def print_reg(kernel, kernel_name):
-    print("%s Registers : %d" % (kernel_name, kernel.num_regs))
-    print("%s Local bytes : %d" % (kernel_name, kernel.local_size_bytes))
-    print("%s Shared bytes : %d" % (kernel_name, kernel.shared_size_bytes))
-    print()
 
 """
 Load address list from file
 """
 def load_list(filename, target_n):
-    address_list = []
 
-    with open(filename) as csv_file:
-        csv_reader = csv.reader(csv_file, delimiter=',')
+    with open(filename) as csv_file1:
+        csv_reader1 = csv.reader(csv_file1, delimiter=',')
         address_list = []
-        for row in csv_reader:
-            address_list.append([int(row[1])])
+        for row1 in csv_reader1:
+            address_list.append([int(row1[1])])
             if len(address_list)>target_n:
               return np.asarray(address_list, dtype="uint64")
 
@@ -395,13 +331,12 @@ def load_list(filename, target_n):
 
 
 def load_balances(filename, target_n):
-    address_list = []
     array_addresses = []
 
-    with open(filename) as csv_file:
-        csv_reader = csv.reader(csv_file, delimiter=',')
-        for row in csv_reader:
-            array_addresses.append((row[1],float(row[2])))
+    with open(filename) as csv_file1:
+        csv_reader1 = csv.reader(csv_file1, delimiter=',')
+        for row1 in csv_reader1:
+            array_addresses.append((row1[1],float(row1[2])))
             if len(array_addresses)>target_n:
               return array_addresses
     i = 0
@@ -411,74 +346,27 @@ def load_balances(filename, target_n):
 
     return array_addresses
 
-list_sk = []
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 8):
-    sk = (2**(32*i[0])) + (2**(32*i[1])) + (2**(32*i[2])) + (2**(32*i[3])) + (2**(32*i[4])) + (2**(32*i[5])) + (2**(32*i[6])) + (2**(32*i[7]))
-    list_sk.append(sk)
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 7):
-    sk = (2**(32*i[0])) + (2**(32*i[1])) + (2**(32*i[2])) + (2**(32*i[3])) + (2**(32*i[4])) + (2**(32*i[5])) + (2**(32*i[6]))
-    list_sk.append(sk)
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 6):
-    sk = (2**(32*i[0])) + (2**(32*i[1])) + (2**(32*i[2])) + (2**(32*i[3])) + (2**(32*i[4])) + (2**(32*i[5]))
-    list_sk.append(sk)
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 5):
-    sk = (2**(32*i[0])) + (2**(32*i[1])) + (2**(32*i[2])) + (2**(32*i[3])) + (2**(32*i[4]))
-    list_sk.append(sk)
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 4):
-    sk = (2**(32*i[0])) + (2**(32*i[1])) + (2**(32*i[2])) + (2**(32*i[3]))
-    list_sk.append(sk)
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 3):
-    sk = (2**(32*i[0])) + (2**(32*i[1])) + (2**(32*i[2]))
-    list_sk.append(sk)
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 2):
-    sk = (2**(32*i[0])) + (2**(32*i[1]))
-    list_sk.append(sk)
-
-for i in itertools.combinations([0,1,2,3,4,5,6,7], 1):
-    sk = (2**(32*i[0]))
-    list_sk.append(sk)
-
-list_sk.sort()
-
-from nextprime import *
-
 # Initialize np buffers
 fold8_ypx = np.zeros((256, 32), dtype="uint8")
 fold8_ymx = np.zeros((256, 32), dtype="uint8")
 fold8_t  = np.zeros((256, 32), dtype="uint8")
 
-fold8_ypx[0] = int_to_nparray(1)
-fold8_ymx[0] = int_to_nparray(1)
-fold8_t[0] = int_to_nparray(0)
+fold8_table = []
+with open('data/fold8.txt') as csv_file:
+    csv_reader = csv.reader(csv_file, delimiter=',')
+    for fold8_i, row in enumerate(csv_reader):
+        YpX, YmX, T2d = row
 
-table_b_0 = [(1, 1, 0)]
+        YpX = int(YpX)
+        YmX = int(YmX)
+        T2d = int(T2d)
 
-for i in range(1, 256):
-    P = scalarmult_B(list_sk[i-1])
-    (x, y, z, t) = P
+        fold8_table.append((YpX, YmX, T2d))
 
-    invz = inv(z)
-    x = (x * invz) % q
-    y = (y * invz) % q
-    t = (x * y) % q
+        fold8_ypx[fold8_i] = int_to_nparray(YpX)
+        fold8_ymx[fold8_i] = int_to_nparray(YmX)
+        fold8_t[fold8_i] = int_to_nparray(T2d)
 
-    YpX = (y+x)%q
-    YmX = (y-x)%q
-    T2d = (2*d*t)%q
-
-    # append (YpX, YmX, T2d)
-    fold8_ypx[i] = int_to_nparray(YpX)
-    fold8_ymx[i] = int_to_nparray(YmX)
-    fold8_t[i] = int_to_nparray(T2d)
-
-    table_b_0.append((YpX, YmX, T2d))
 
 def cut_fold8(sk):
     Y = []
@@ -496,15 +384,15 @@ def edwards_add2(P, Q):
     (x2, y2, t2) = Q
 
     a = (y1-x1)*y2 % q
-    b = (y1+x1)*x2 % q
+    bb = (y1+x1)*x2 % q
 
     c = t1*t2 % q
     dd = (z1+z1) % q
 
-    e = b - a
+    e = bb - a
     f = dd - c
     g = dd + c
-    h = b + a
+    h = bb + a
 
     x3 = e*f % q
     y3 = g*h % q
@@ -513,11 +401,10 @@ def edwards_add2(P, Q):
 
     return (x3, y3, z3, t3)
 
-
 def edp_BasePointMult(sk):
     cut = cut_fold8(sk)
 
-    P0 = table_b_0[cut[0]]
+    P0 = fold8_table[cut[0]]
     Sx = (P0[0] - P0[1]) % q
     Sy = (P0[0] + P0[1]) % q
 
@@ -525,7 +412,7 @@ def edp_BasePointMult(sk):
 
     for i in range(1, 32):
         S = edwards_double(S)
-        S = edwards_add2(S, table_b_0[cut[i]])
+        S = edwards_add2(S, fold8_table[cut[i]])
 
     (x, y, z, t) = S
 
@@ -536,26 +423,24 @@ def edp_BasePointMult(sk):
 
     return (x, y, 1, t, cut)
 
-def debug_generate(blocks, n_batch, regen_sk, B_mult_table_sk, random_sk_array, n_address_list, address_list_orig):
-    sk_index_test = random.randint(0, blocks-1)
-    B_mult_table_sk_random = random.randint(0, (n_batch-1))
-    regen_sk_random = random.randint(0, regen_sk-1)
+def debug_generate(device, blocks, n_batch, regen_sk, scalar_y_table, random_sk_list, n_address_list, address_list_orig):
+    scalar_x_index = random.randint(0, blocks-1)
+    scalar_y_index = random.randint(0, n_batch-1)
+    random_iteration = random.randint(0, regen_sk-1)
 
-    test_inc = (B_mult_table_sk[B_mult_table_sk_random]+B_mult_table_sk[(n_batch-1)]*regen_sk_random)%l
-    test_inc2 = (l-B_mult_table_sk[B_mult_table_sk_random]+B_mult_table_sk[(n_batch-1)]*regen_sk_random)%l
+    test_inc1 = (scalar_y_table[scalar_y_index]+scalar_y_table[(n_batch-1)]*random_iteration)%l
+    test_inc2 = (l-scalar_y_table[scalar_y_index]+scalar_y_table[(n_batch-1)]*random_iteration)%l
 
-    test_sk = random_sk_array[sk_index_test]
-    test_sk = (test_sk + test_inc)%l
-    test_pk = int_to_pk(test_sk)
+    test_sk1 = random_sk_list[scalar_x_index]
+    test_sk1 = (test_sk1 + test_inc1)%l
+    test_pk = int_to_pk(test_sk1)
 
-    test_sk2 = (random_sk_array[sk_index_test] + test_inc2)%l
+    test_sk2 = (random_sk_list[scalar_x_index] + test_inc2)%l
     test_pk2 = int_to_pk(test_sk2)
-
-    address_i = random.randint(0, n_address_list-1)
 
     address_list = np.copy(address_list_orig)
 
-    # Address to test
+    # Generate 16 addresses
     address_gen_test_a = [0,1,2,3,4,5,6,7]
 
     address_gen_test_a[0] = public_key_sha256_dual(int_to_nparray(test_pk[1]%q).copy())
@@ -568,19 +453,122 @@ def debug_generate(blocks, n_batch, regen_sk, B_mult_table_sk, random_sk_array, 
     address_gen_test_a[6] = public_key_sha256_dual(int_to_nparray(((test_pk2[1]*-1))%q).copy())
     address_gen_test_a[7] = public_key_sha256_dual(int_to_nparray(((test_pk2[0]*I*-1%q))%q).copy())
 
-    print(address_gen_test_a)
-
     type_b = random.randint(0, 7)
     address_gen_test = address_gen_test_a[type_b]
 
     type_a = random.randint(0, 1)
+
+    address_i = random.randint(0, n_address_list - 1)
     address_list[address_i] = address_gen_test[type_a]
-    print("\nSelect test address: %s - sk index %d - sk %s - inc %d - B_mult_table_sk_random %d - address_i %d - type_a %d - type_b %d\n" % (str(address_list[address_i][0]), sk_index_test, int_to_hex(random_sk_array[sk_index_test]), test_inc, B_mult_table_sk_random, address_i, type_a, type_b))
-    print("Calculated sk %s | regen_sk_random %s \n" % (int_to_hex(test_sk), regen_sk_random))
+
+    out_str = f"""
+--------------------------
+- DEBUG/TEST PARAMETERS
+- Device : {device}
+- Scalar x index: {scalar_x_index}
+- Scalar y index: {scalar_y_index}
+- Scalar x : {random_sk_list[scalar_x_index]}
+- Scalar y 1 : {test_inc1}
+- Scalar y 2 : {test_inc2}
+- Random iteration : {random_iteration}
+- Hex secret key 1 (x+(y*iter)) : {int_to_hex(test_sk1).decode('utf-8')}
+- Hex secret key 2 (x+(l-y*iter)) : {int_to_hex(test_sk2).decode('utf-8')}
+- List of generated addresses : {address_gen_test_a}
+- Address index : addresses[{type_a}][{type_b}]
+- Target Test address : {address_list[address_i][0]}L
+--------------------------
+                    """
+    print(out_str)
 
     address_list.sort(axis=0)
 
     return address_list
 
+def test_found(device, found_flag, inc_count, n_batch, B_mult_table_sk, blocks, random_sk_list, balances, output_filename, debug_test, target_list):
+    debug_test_found = False
+    print()
+    print("Checking found...")
 
-print("--- Lib Initialization %s seconds ---" % (time.time() - start_time))
+    found_flag_i = found_flag[0] >> 1
+    increment_ff = math.floor(((found_flag_i) % (n_batch)))
+    increment_1 = B_mult_table_sk[increment_ff] + inc_count * B_mult_table_sk[(n_batch - 1)]
+    increment_2 = l - B_mult_table_sk[increment_ff] + inc_count * B_mult_table_sk[(n_batch - 1)]
+
+    c_id1 = (found_flag_i) - (blocks * n_batch)
+    c_id2 = (found_flag_i) - (blocks * n_batch) * 2
+    c_id3 = (found_flag_i) - (blocks * n_batch) * 3
+
+    c_id_array = [(found_flag_i - increment_ff) // n_batch, (c_id1 - increment_ff) // n_batch,
+                  (c_id2 - increment_ff) // n_batch, (c_id3 - increment_ff) // n_batch]
+    for sk_index in c_id_array:
+        if sk_index < len(random_sk_list):
+            sk_index = math.floor(sk_index)
+
+            found_sk_orig = random_sk_list[sk_index]
+
+            found_sk_1 = found_sk_orig + increment_1
+            found_sk_2 = found_sk_orig + increment_2
+
+            found_sk_hex_calc_1 = int_to_hex(found_sk_1)
+            found_sk_hex_calc_2 = int_to_hex(found_sk_2)
+
+            found_pks_1 = privatetopublickey(found_sk_1)
+            found_pks_2 = privatetopublickey(found_sk_2)
+
+            found_pk = 0
+            select_address = 0
+            found = 0
+
+            found_sk_hex_calc = ''
+            increment = 0
+
+            for pk in found_pks_1:
+                if np.isin(int(liskpktoaddr(pk)), target_list):
+                    found_pk = pk
+                    select_address = str(int(liskpktoaddr(pk)))
+                    found_sk_hex_calc = found_sk_hex_calc_1
+                    increment = increment_1
+                    found = 1
+
+            for pk in found_pks_2:
+                if np.isin(int(liskpktoaddr(pk)), target_list):
+                    found_pk = pk
+                    select_address = str(int(liskpktoaddr(pk)))
+                    found_sk_hex_calc = found_sk_hex_calc_2
+                    increment = increment_2
+                    found = 1
+
+            if found:
+                balance = 0
+                for address_balance in balances:
+                    if str(select_address) == str(address_balance[0]):
+                        balance = address_balance[1]
+
+                out_str = f"""
+--------------------------
+- Device : {device}
+- Target found at gid {found_flag[0]} | Iteration {inc_count} | Scalar x index {sk_index}
+- Scalar x : {found_sk_orig}
+- Scalar y : {increment}
+- Hex secret key (x+y) : {found_sk_hex_calc.decode('utf-8')}
+- Public Key : {found_pk.decode('utf-8')}
+- Balance : {balance} LSK
+- Target : {select_address}L
+--------------------------
+- address,public_key,secret_key,balance
+- {select_address}L,{found_pk.decode('utf-8')},{found_sk_hex_calc.decode('utf-8')},{balance}
+--------------------------
+                """
+                print(out_str)
+
+                if not debug_test:
+                    res_file = open(str(output_filename), "a+")
+                    res_file.write(f"{select_address}L,{found_pk.decode('utf-8')},{found_sk_hex_calc.decode('utf-8')},{balance}\n")
+                    res_file.close()
+
+                if debug_test:
+                    debug_test_found = True
+
+                break
+
+    return debug_test_found

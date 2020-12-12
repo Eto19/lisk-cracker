@@ -1,635 +1,593 @@
-def main():
-    try:
-        print("Starting...")
-        parser = argparse.ArgumentParser()
-        parser.add_argument('--gpu-idx', dest="device_id", type=int, default=0, help="Run on specified gpu idx. multi-gpu not supported. Default: 0")
-        parser.add_argument('--input-targets-file', dest="list_filename", default="list_01.txt", help="CSV list of targets, comma delimiter, target in row 1. Default: list_01.txt")
-        parser.add_argument('--n-targets', dest="n_target", type=int, default=1000, help="Number of targets to search, fill with targets from 0 to n if n>target in file, recommended below 10000 for better performance. Default: 1000")
-        parser.add_argument('--output-results-file', dest="output_filename", default="results.txt", help="Write found targets to this file. Default: results.txt")
-        parser.add_argument('--testing-mode', dest="debug_test", type=bool, default=False, help="Activate this option to test dummy targets, used to check computations and performance, if there is an error the program will crash, if everything is working it will output results every 20 iterations. Default: False")
-        parser.add_argument('--batch-size', dest="n_batch", type=int, default=512, choices=[16, 32, 64, 128, 256, 512], help="batch size, lower to use less vram. Default: 512")
+from lib_ed import *
+from nextprime import *
 
-        args = parser.parse_args()
+import threading
+import sys
+import argparse
+import pycuda.compiler
+import pycuda.tools
+import pycuda.driver as drv
 
-        if args.debug_test:
-            print("DEBUG MODE ACTIVATED. NOT SEARCHING IN " + args.list_filename + " !")
+def load_module_new(module_name, module_file, nvcc_options, nvcc_include_dirs, cubin_cache_enable, kernel_str='default'):
+    cu_hexhash = hashlib.md5(bytearray(module_file, 'utf-8')).hexdigest()
+    kernel_hexhash = hashlib.md5(bytearray(kernel_str, 'utf-8')).hexdigest()
+    cu_hexhash_from_file = ''
 
-        device_id = args.device_id
-        list_filename = args.list_filename
-        n_batch = args.n_batch
-        debug_test = args.debug_test
-        output_stats = 50 # OUTPUT STATS EVERY X ITERATIONS
-        regen_sk = 1000 # REGENERATE RANDOM SEED KEYS EVERY X ITERATIONS
-        profiling_enabled = False
-        cubin_cache = True # SAVE COMPILED KERNELS TO DISK
+    if not (os.path.exists(f"cubin_cache/{module_name}_{kernel_hexhash}.txt")):
+        cache_file = open(f"cubin_cache/{module_name}_{kernel_hexhash}.txt", 'w+')
+        cache_file.write(cu_hexhash)
+        cache_file.close()
+    else:
+        cache_file = open(f"cubin_cache/{module_name}_{kernel_hexhash}.txt", 'r')
+        cu_hexhash_from_file = cache_file.read()
+        cache_file.close()
 
-        # BLOOM FILTER CONFIG
-        bloom_filter_k_hash = 5
-        bloom_filter_p = 1.0e-10
-        target_n = args.n_target
+    if (cu_hexhash_from_file == cu_hexhash) & (os.path.isfile(f"cubin/{cu_hexhash_from_file}_{kernel_hexhash}_cubin.cubin")) & cubin_cache_enable:
+        print(f"Load cached {module_name} kernel !")
+        return drv.module_from_file(f"cubin/{cu_hexhash}_{kernel_hexhash}_cubin.cubin")
+    else:
+        if os.path.isfile(f"cubin/{cu_hexhash_from_file}_{kernel_hexhash}_cubin.cubin"):
+            os.remove(f"cubin/{cu_hexhash_from_file}_{kernel_hexhash}_cubin.cubin")
 
-        print(pycuda.VERSION)
-        print(pycuda.VERSION_STATUS)
-        print(pycuda.VERSION_TEXT)
+    cache_file = open(f"cubin_cache/{module_name}_{kernel_hexhash}.txt", 'w')
+    cache_file.write(cu_hexhash)
+    cache_file.close()
 
-        drv.init()
-        print(sys.version)
+    print(f"Caching {module_name} kernel !")
 
-        print("LIST OF AVAILABLE CUDA DEVICES :")
-        for i in range(drv.Device.count()):
-            dev = drv.Device(i)
-            print(" -GPU IDX: %d, name: %s" % (i, dev.name()))
-            print("   Compute Capability: %d.%d" % dev.compute_capability())
-            print("   Total Memory: %s KB" % (dev.total_memory()//(1024)))
-            print("   MULTIPROCESSOR_COUNT: %d" % (dev.get_attribute(drv.device_attribute.MULTIPROCESSOR_COUNT)))
-            print("   WARP_SIZE: %d" % (dev.get_attribute(drv.device_attribute.WARP_SIZE)))
+    cubin = pycuda.compiler.compile(module_file, options=nvcc_options, include_dirs=nvcc_include_dirs, cache_dir=None)
+    save_cubin(cubin, f"cubin/{cu_hexhash}_{kernel_hexhash}_cubin.cubin")
 
-        blocks = dev.get_attribute(drv.device_attribute.MULTIPROCESSOR_COUNT)*8*64
+    return drv.module_from_file(f"cubin/{cu_hexhash}_{kernel_hexhash}_cubin.cubin")
 
-        dev = drv.Device(device_id)
+class GPUThread(threading.Thread):
+    def __init__(self, gpu_id, batch_size, tid):
+        threading.Thread.__init__(self)
 
-        # drv.ctx_flags.SCHED_BLOCKING_SYNC | drv.event_flags.BLOCKING_SYNC
-        ctx = dev.make_context(drv.ctx_flags.SCHED_BLOCKING_SYNC)
+        self._stop_event = threading.Event()
 
-        stream = drv.Stream(drv.event_flags.BLOCKING_SYNC)
-        start_event = drv.Event(drv.event_flags.BLOCKING_SYNC)
-        end_event = drv.Event(drv.event_flags.BLOCKING_SYNC)
+        self.gpu_id = gpu_id
+        self.tid = tid
+        self.n_batch = batch_size
 
-        if profiling_enabled:
-            drv.start_profiler()
+        self.dev = drv.Device(gpu_idx)
+        self.blocks = self.dev.get_attribute(drv.device_attribute.MULTIPROCESSOR_COUNT) * 8 * 64
 
-        device_data = pycuda.tools.DeviceData()
+        self.grid = (self.blocks, 1)
+        self.grid_2 = (self.blocks*2, 1)
+        self.grid256 = (self.blocks//self.n_batch, 1)
+        self.gridsha256 = (self.blocks*8, 1)
+        self.block = (self.n_batch, 1, 1)
 
-        print()
-        print("SELECTED GPU IDX : %d " % device_id)
-        print("registers : %d " % device_data.registers)
-        print("shared_memory : %d " % device_data.shared_memory)
-        print()
+        self.grid_scalarmult = (self.blocks//256, 1)
+        self.block_scalarmult = (256, 1, 1)
 
-        nvcc_options = ['-use_fast_math', '--generate-line-info']
-        nvcc_include_dirs = [os.path.realpath("") + "/inc_cu"]
-
-        # CHOOSE MODE (REAL/DEMO)
-        if debug_test:
-            n_address_list = target_n
-            n_loop = 100000
-            regen_sk = 20 # IN TESTING MODE REGEN SK EVERY 20 ITERATION
-        else:
-            address_list = load_list(list_filename, target_n)
-            balances = load_balances(list_filename, target_n)
-            n_address_list = address_list.size
-            n_loop = 100000000000000
-
-        # Calculated parameters
-        block_size = n_batch
-        grid = (blocks, 1)
-        grid_2 = (blocks*2, 1)
-        grid256 = (blocks//n_batch, 1)
-        grid256_2 = (blocks//n_batch, 1)
-        gridsha256 = (blocks*8, 1)
-        block = (block_size, 1, 1)
-
-        grid_scalarmult = (blocks//256, 1)
-        block_scalarmult = (256, 1, 1)
-
-        global_size = block_size*blocks
+        self.global_size = self.n_batch * self.blocks
+        self.target_count = target_list.size
 
         # Calculate bloom filter size
-        bloom_filter_size = next_prime(math.ceil(n_address_list * (-bloom_filter_k_hash / math.log(1 - math.exp(math.log(bloom_filter_p) / bloom_filter_k_hash)))))
+        self.bloom_filter_k_hash = bloom_filter_k_hash
+        self.bloom_filter_p = bloom_filter_p
 
-        print("blocks: %d" % blocks)
-        print("block_size: %d" % block_size)
-        print("global_size: %d" % global_size)
-        print("grid: %d" % grid[0])
-        print("grid256: %d" % grid256[0])
-        print("gridsha256: %d" % gridsha256[0])
-        print()
-        print("Addresses to search : %d" % n_address_list)
-        print("bloom_filter_size : %d" % bloom_filter_size)
-        print()
+        self.bloom_filter_size = bloom_filter_size
 
-        # Load cuda sources files
         batch_ge_add_file = open("cu/batch_ge_add.cu", "r").read()
         batch_inv_file = open("cu/batch_inv.cu", "r").read()
         sha256_file = open("cu/sha256_2.cu", "r").read()
         scalarmult_b_file = open("cu/scalarmult_b.cu", "r").read()
 
-        # Add define
-        sha256_file = get_define("BLOCKS", blocks, sha256_file)
-        sha256_file = get_define("N_BATCH", n_batch, sha256_file)
+        batch_inv_file = get_define("BLOCKS", self.blocks, batch_inv_file)
+        batch_inv_file = get_define("N_BATCH", self.n_batch, batch_inv_file)
 
-        batch_inv_file = get_define("BLOCKS", blocks, batch_inv_file)
-        batch_inv_file = get_define("N_BATCH", n_batch, batch_inv_file)
+        sha256_file = get_define("BLOCKS", self.blocks, sha256_file)
+        sha256_file = get_define("N_BATCH", self.n_batch, sha256_file)
+        sha256_file = get_define("SIZE_LIST", self.target_count, sha256_file)
+        sha256_file = get_define("SIZE_LIST_ODD", (self.target_count & 1), sha256_file)
+        sha256_file = get_define("BLOOM_FILTER_SIZE", self.bloom_filter_size, sha256_file)
+        sha256_file = get_define("K_HASH", self.bloom_filter_k_hash, sha256_file)
 
-        sha256_file = get_define("SIZE_LIST", n_address_list, sha256_file)
-        sha256_file = get_define("SIZE_LIST_ODD", (n_address_list&1), sha256_file)
-        sha256_file = get_define("BLOOM_FILTER_SIZE", bloom_filter_size, sha256_file)
-        sha256_file = get_define("K_HASH", bloom_filter_k_hash, sha256_file)
-        
-        batch_ge_add_file = get_define("BLOCKS", blocks, batch_ge_add_file)
-        batch_ge_add_file = get_define("N_BATCH", n_batch, batch_ge_add_file)
+        batch_ge_add_file = get_define("BLOCKS", self.blocks, batch_ge_add_file)
+        batch_ge_add_file = get_define("N_BATCH", self.n_batch, batch_ge_add_file)
 
-        scalarmult_b_file = get_define("BLOCKS", blocks, scalarmult_b_file)
+        scalarmult_b_file = get_define("BLOCKS", self.blocks, scalarmult_b_file)
         scalarmult_b_file = get_define("N_BATCH", 256, scalarmult_b_file)
 
-        # Load modules
-        batch_ge_add = load_module_new('batch_ge_add', batch_ge_add_file, nvcc_options, nvcc_include_dirs, cubin_cache)
-        batch_inv = load_module_new('batch_inv', batch_inv_file, nvcc_options, nvcc_include_dirs, cubin_cache)
-        sha256_quad = load_module_new('sha256_quad', sha256_file, nvcc_options, nvcc_include_dirs, cubin_cache)
-        scalarmult_b_module = load_module_new('scalarmult_b', scalarmult_b_file, nvcc_options, nvcc_include_dirs, cubin_cache) 
+        nvcc_options = ['-use_fast_math', '--generate-line-info']
+        nvcc_include_dirs = [os.path.realpath("") + "/inc_cu"]
 
-        print()
+        self.ctx = self.dev.retain_primary_context()
+        self.ctx.push()
 
-        # Load kernels from modules
-        func_batch_ge_add_step0 = batch_ge_add.get_function("batch_ge_add_step0")
-        func_batch_ge_add_step1 = batch_ge_add.get_function("batch_ge_add_step1")
+        if profiling_enabled:
+            drv.start_profiler()
 
-        func_batch_inv_step0 = batch_inv.get_function("batch_inv_step0")
-        func_batch_inv_step1 = batch_inv.get_function("batch_inv_step1")
-        func_batch_inv_step2 = batch_inv.get_function("batch_inv_step2")
-        func_calc_next_point = batch_inv.get_function("calc_next_optimized_point")
+        self.kernel_str = f"{self.blocks}x{self.n_batch}_{self.dev.name().lower().replace(' ', '_')}"
 
-        func_sha256_quad = sha256_quad.get_function("sha256_quad")
+        batch_ge_add = load_module_new('batch_ge_add', batch_ge_add_file, nvcc_options, nvcc_include_dirs, cubin_cache, self.kernel_str)
+        batch_inv = load_module_new('batch_inv', batch_inv_file, nvcc_options, nvcc_include_dirs, cubin_cache, self.kernel_str)
+        sha256_quad = load_module_new('sha256_quad', sha256_file, nvcc_options, nvcc_include_dirs, cubin_cache, self.kernel_str)
+        scalarmult_b_module = load_module_new('scalarmult_b', scalarmult_b_file, nvcc_options, nvcc_include_dirs, cubin_cache, self.kernel_str)
 
-        func_scalarmult_b = scalarmult_b_module.get_function("scalarmult_b")
-        func_bloom_filter_init = sha256_quad.get_function("bloom_filter_init")
+        self.func_batch_ge_add_step0 = batch_ge_add.get_function("batch_ge_add_step0")
+        self.func_batch_ge_add_step1 = batch_ge_add.get_function("batch_ge_add_step1")
 
-        # Initialize np buffers
-        B_mult_table_xmy = np.zeros((n_batch, 32), dtype="uint8")
-        B_mult_table_xpy = np.zeros((n_batch, 32), dtype="uint8")
-        B_mult_table_t2d = np.zeros((n_batch, 32), dtype="uint8")
+        self.func_batch_inv_step0 = batch_inv.get_function("batch_inv_step0")
+        self.func_batch_inv_step1 = batch_inv.get_function("batch_inv_step1")
+        self.func_batch_inv_step2 = batch_inv.get_function("batch_inv_step2")
+        self.func_calc_next_point = batch_inv.get_function("calc_next_optimized_point")
 
-        data_out_xy = np.empty((global_size*4, 32), dtype="uint8")
-        data_in_z   = np.empty((global_size, 32), dtype="uint8")
-        data_w      = np.empty((global_size, 32), dtype="uint8")
+        self.func_sha256_quad = sha256_quad.get_function("sha256_quad")
 
-        found_flag  = np.empty((1), dtype="int32")
-        found_flag[0] = -1
+        self.func_scalarmult_b = scalarmult_b_module.get_function("scalarmult_b")
+        self.func_bloom_filter_init = sha256_quad.get_function("bloom_filter_init")
 
-        data_in_xmy = np.zeros((blocks, 32), dtype="uint8")
-        data_in_xpy = np.zeros((blocks, 32), dtype="uint8")
-        data_in_t = np.zeros((blocks, 32), dtype="uint8")
+        self.y_seed_table_xmy = np.zeros((self.n_batch, 32), dtype="uint8")
+        self.y_seed_table_xpy = np.zeros((self.n_batch, 32), dtype="uint8")
+        self.y_seed_table_t2d = np.zeros((self.n_batch, 32), dtype="uint8")
 
-        # FILL WITH DUMMY TARGETS
-        if debug_test:
-            address_list_orig = load_list(list_filename, target_n)
-            balances = load_balances(list_filename, target_n)
-            if target_n >= address_list_orig.size:
-                address_list = np.copy(address_list_orig)
-            else:
-                address_list_orig = np.random.randint(0, 2**64, (target_n, 1), dtype="uint64")
-                address_list = np.copy(address_list_orig)
+        self.found_flag  = np.empty((1), dtype="int32")
+        self.found_flag[0] = -1
+
+        self.np_random_x_seed_table = np.zeros((self.blocks, 8), dtype="uint32")
 
         # Allocate GPU buffers
         # CONSTANT
-        const_b_table_xmy_gpu = drv.mem_alloc(B_mult_table_xmy.nbytes)
-        const_b_table_xpy_gpu = drv.mem_alloc(B_mult_table_xpy.nbytes)
-        const_b_table_t_gpu = drv.mem_alloc(B_mult_table_t2d.nbytes)
-        fold8_ypx_gpu = drv.mem_alloc(fold8_ypx.nbytes)
-        fold8_ymx_gpu = drv.mem_alloc(fold8_ymx.nbytes)
-        fold8_t_gpu = drv.mem_alloc(fold8_t.nbytes)
+        self.const_b_table_xmy_gpu = drv.mem_alloc(self.y_seed_table_xmy.nbytes)
+        self.const_b_table_xpy_gpu = drv.mem_alloc(self.y_seed_table_xpy.nbytes)
+        self.const_b_table_t_gpu = drv.mem_alloc(self.y_seed_table_t2d.nbytes)
+        self.fold8_ypx_gpu = drv.mem_alloc(fold8_ypx.nbytes)
+        self.fold8_ymx_gpu = drv.mem_alloc(fold8_ymx.nbytes)
+        self.fold8_t_gpu = drv.mem_alloc(fold8_t.nbytes)
 
         # MEMSET 0
-        data_out_xy_gpu = drv.mem_alloc(data_out_xy.nbytes)
-        data_in_z_gpu = drv.mem_alloc(data_in_z.nbytes)
-        data_w_gpu = drv.mem_alloc(data_w.nbytes)
-        found_flag_gpu = drv.mem_alloc(found_flag.nbytes)
+        self.data_out_xy_gpu = drv.mem_alloc(self.global_size*4*32)
+        self.data_in_z_gpu = drv.mem_alloc(self.global_size*32)
+        self.data_w_gpu = drv.mem_alloc(self.global_size*32)
+        self.found_flag_gpu = drv.mem_alloc(self.found_flag.nbytes)
 
         # VARIABLES
-        data_in_xmy_gpu = drv.mem_alloc(data_in_xmy.nbytes)
-        data_in_xpy_gpu = drv.mem_alloc(data_in_xpy.nbytes)
-        data_in_t_gpu = drv.mem_alloc(data_in_t.nbytes)
+        self.data_in_xmy_gpu = drv.mem_alloc(self.blocks*32)
+        self.data_in_xpy_gpu = drv.mem_alloc(self.blocks*32)
+        self.data_in_t_gpu = drv.mem_alloc(self.blocks*32)
 
-        np_random_sk_array = np.zeros((blocks, 8), dtype="uint32")
-        np_random_sk_array_gpu = drv.mem_alloc(np_random_sk_array.nbytes)
+        self.random_x_seed_table_gpu = drv.mem_alloc(self.np_random_x_seed_table.nbytes)
 
-        # Calculate total memory allocated
-        total_allocated = (B_mult_table_xmy.nbytes*3) + (data_w.nbytes*2) + (data_in_xmy.nbytes*3) + (data_out_xy.nbytes) + (address_list.nbytes) + (found_flag.nbytes) + (np_random_sk_array.nbytes) + (fold8_ypx.nbytes*3) + (bloom_filter_size//8)
-        print("Total VRAM usage: %f GBytes" % (total_allocated/1000000000))
+        self.target_list = target_list
+        self.target_list.sort(axis=0)
 
-        # Generate optimized B table
-        B_mult_table_sk = []
+        # Calculate total GPU memory allocated
+        total_allocated = (self.y_seed_table_xmy.nbytes*3) + (self.global_size*32*2) + (self.blocks*32*3) + (self.global_size*4*32) + (self.target_list.nbytes) + (self.found_flag.nbytes) + (self.np_random_x_seed_table.nbytes) + (fold8_ypx.nbytes*3) + (self.bloom_filter_size//8)
+        print(f"Allocated {round(total_allocated/1000000000, 4)} GB on GPU #{self.gpu_id}, Thread {self.tid}, {self.dev.name()}")
 
-        # Generate optimized B table
-        B_mult_table_sk = []
+        self.y_seed_table = []
+        self.random_x_seed_table = []
 
-        k = 2*d % q
-        for i in range(1, n_batch+1):
-            B_mult_sk = (secrets.randbelow(2**200) * 8)
-            xB = edp_BasePointMult(B_mult_sk)
-            B_mult_table_sk.append(B_mult_sk)
-            (x, y, z, t, cut) = xB
+        self.target_list_low = []
+        self.target_list_high = []
 
-            # precomp
-            t2d = k*t % q
-            xmy = (y-x) % q
-            xpy = (y+x) % q
+        self.balances = balances
+        self.target_list_orig = load_list(list_filename, target_n)
 
-            # append (xmy, xpy, t2d)
-            B_mult_table_xmy[i-1] = int_to_nparray(xmy)
-            B_mult_table_xpy[i-1] = int_to_nparray(xpy)
-            B_mult_table_t2d[i-1] = int_to_nparray(t2d)
-
-        """
-        INITIAL HOST TO DEVICE MEMORY TRANSFER
-        """
-        # CONSTANT
-        drv.memcpy_htod(const_b_table_xmy_gpu, B_mult_table_xmy)
-        drv.memcpy_htod(const_b_table_xpy_gpu, B_mult_table_xpy)
-        drv.memcpy_htod(const_b_table_t_gpu, B_mult_table_t2d)
-
-        # MEMSET 0
-        drv.memset_d8(data_out_xy_gpu, 0, data_out_xy.nbytes)
-        drv.memset_d8(data_in_z_gpu, 0, data_in_z.nbytes)
-        drv.memset_d8(data_w_gpu, 0, data_w.nbytes)
-
-        # VARIABLES
-        drv.memcpy_htod(data_in_xmy_gpu, data_in_xmy)
-        drv.memcpy_htod(data_in_xpy_gpu, data_in_xpy)
-        drv.memcpy_htod(data_in_t_gpu, data_in_t)
-
-        drv.memcpy_htod(fold8_ypx_gpu, fold8_ypx)
-        drv.memcpy_htod(fold8_ymx_gpu, fold8_ymx)
-        drv.memcpy_htod(fold8_t_gpu, fold8_t)
-
-        # set found flag to -1
-        drv.memcpy_htod(found_flag_gpu, found_flag)
-
-        func_scalarmult_b.prepare(["P"]*7)
-        func_bloom_filter_init.prepare(["P"]*3)
-
-        elapsed_time = 0
-
-        # GENERATE SECRET KEYS AND PUBLIC KEYS
-        random_sk_array = []
-        for i in range(blocks):
-            random_sk = (secrets.randbelow(2**240) * 8)
-            random_sk_array.append(random_sk)
-            np_random_sk_array[i] = int_to_nparray32(random_sk)
-
-
-        drv.memcpy_htod(np_random_sk_array_gpu, np_random_sk_array)
-
-        elapsed_time_1 = func_scalarmult_b.prepared_timed_call(
-                grid_scalarmult, block_scalarmult,
-                fold8_ypx_gpu,
-                fold8_ymx_gpu,
-                fold8_t_gpu,
-                data_in_xmy_gpu, 
-                data_in_xpy_gpu, 
-                data_in_t_gpu,
-                np_random_sk_array_gpu)()
-
-        print("-- Generate sk and pk --")
-
-        # GENERATE OF TESTING PARAMETERS
-        if debug_test:
-            address_list = debug_generate(blocks, n_batch, regen_sk, B_mult_table_sk, random_sk_array, n_address_list, address_list_orig)
-
-        # Sort haystack and transfer to device
-        address_list.sort(axis=0)
-
-        full_haystack = drv.mem_alloc(address_list.nbytes)
-        drv.memcpy_htod(full_haystack, address_list)
-
-        address_list2 = address_list.view(dtype=np.dtype([('f1', np.uint32), ('f2', np.uint32)]))
-
-        address_list4 = []
-        address_list3 = []
-        for x in address_list2:
-            address_list3.append([x[0][1]])
-            address_list4.append([x[0][0]])
-
-        address_list3 = np.asarray(address_list3, dtype="uint32")
-        address_list4 = np.asarray(address_list4, dtype="uint32")
-
-        bsearch_haystack2 = drv.mem_alloc(address_list3.nbytes)
-        drv.memcpy_htod(bsearch_haystack2, address_list3)
-
-        bsearch_haystack = drv.mem_alloc(address_list4.nbytes)
-        drv.memcpy_htod(bsearch_haystack, address_list4)
-
-        bloom_filter = np.zeros(bloom_filter_size//8, dtype="uint8")
-        bloom_filter_gpu = drv.mem_alloc(bloom_filter.nbytes)
-        drv.memcpy_htod(bloom_filter_gpu, bloom_filter)
-
-        func_bloom_filter_init.prepared_timed_call(
-                (1, 1), (1, 1, 1),
-                bsearch_haystack2,
-                bsearch_haystack,
-                bloom_filter_gpu
-        )()
+        self.full_haystack = drv.mem_alloc(self.target_list.nbytes)
+        self.bsearch_haystack_low = drv.mem_alloc(self.target_list.nbytes//2)
+        self.bsearch_haystack_high = drv.mem_alloc(self.target_list.nbytes//2)
+        self.bloom_filter_gpu = drv.mem_alloc(self.bloom_filter_size // 8)
 
         # Prepare functions
-        func_batch_ge_add_step0.prepare(["P"]*8)
-        func_batch_ge_add_step1.prepare(["P"]*5)
+        self.func_batch_ge_add_step0.prepare(["P"] * 8)
+        self.func_batch_ge_add_step1.prepare(["P"] * 5)
 
-        func_batch_inv_step0.prepare(["P"]*2)
-        func_batch_inv_step1.prepare(["P"])
-        func_batch_inv_step2.prepare(["P"]*3)
+        self.func_batch_inv_step0.prepare(["P"] * 2)
+        self.func_batch_inv_step1.prepare(["P"])
+        self.func_batch_inv_step2.prepare(["P"] * 3)
 
-        func_calc_next_point.prepare(["P"]*5)
+        self.func_calc_next_point.prepare(["P"] * 5)
 
-        func_sha256_quad.prepare(["P"]*8)
+        self.func_sha256_quad.prepare(["P"] * 8)
+
+        self.func_scalarmult_b.prepare(["P"] * 7)
+        self.func_bloom_filter_init.prepare(["P"] * 3)
+
+        self.stream = drv.Stream()
+        self.start_event = drv.Event()
+        self.end_event = drv.Event()
+
+        self.debug_test_found = True
+
+        self.total_iter_count = 0
+        self.last_iter_count = 0
+        self.total_time = 0
+        self.last_stats_str = ''
+        self.last_hashrate = 0
+        self.output_stats_time = time.time()
+
+        self.total_iter_time = 0
+        self.total_gpu_time = 0
+
+        self.scalarmult_b_time = 0
+
+    def gpu_init(self):
+        self.y_seed_table = []
+        for sk_index in range(1, self.n_batch+1):
+            y_seed = (secrets.randbelow(2**200) * 8)
+            self.y_seed_table.append(y_seed)
+
+            (y_seed_x, y_seed_y, y_seed_z, y_seed_t, cut) = edp_BasePointMult(y_seed)
+
+            # precomp
+            t2d = 2*d*y_seed_t % q
+            ymx = (y_seed_y-y_seed_x) % q
+            ypx = (y_seed_y+y_seed_x) % q
+
+            # append (xmy, xpy, t2d)
+            self.y_seed_table_xmy[sk_index-1] = int_to_nparray(ymx)
+            self.y_seed_table_xpy[sk_index-1] = int_to_nparray(ypx)
+            self.y_seed_table_t2d[sk_index-1] = int_to_nparray(t2d)
+
+        self.random_x_seed_table = []
+        for block in range(self.blocks):
+            random_sk = (secrets.randbelow(2**240) * 8)
+            self.random_x_seed_table.append(random_sk)
+            self.np_random_x_seed_table[block] = int_to_nparray32(random_sk)
+
+        if debug_test:
+            if not self.debug_test_found:
+                print("ERROR - TEST ADDRESS NOT FOUND\n")
+                exit()
+            self.debug_test_found = False
+            self.target_list = debug_generate(f"GPU #{self.gpu_id}, Thread {self.tid}, {self.dev.name()}",self.blocks, self.n_batch, rekey, self.y_seed_table, self.random_x_seed_table, self.target_count, self.target_list_orig)
+
+        # Prepare target list
+        target_list_2 = self.target_list.view(dtype=np.dtype([('f1', np.uint32), ('f2', np.uint32)]))
+
+        self.target_list_low = []
+        self.target_list_high = []
+
+        for address in target_list_2:
+            self.target_list_low.append([address[0][1]])
+            self.target_list_high.append([address[0][0]])
+
+        # low 32 bits of addresses
+        self.target_list_low = np.asarray(self.target_list_low, dtype="uint32")
+
+        # high 32 bits of addresses
+        self.target_list_high = np.asarray(self.target_list_high, dtype="uint32")
+
+        """
+        HOST TO DEVICE MEMORY TRANSFER
+        """
+        # CONSTANTS
+        drv.memcpy_htod(self.const_b_table_xmy_gpu, self.y_seed_table_xmy)
+        drv.memcpy_htod(self.const_b_table_xpy_gpu, self.y_seed_table_xpy)
+        drv.memcpy_htod(self.const_b_table_t_gpu, self.y_seed_table_t2d)
+
+        drv.memcpy_htod(self.fold8_ypx_gpu, fold8_ypx)
+        drv.memcpy_htod(self.fold8_ymx_gpu, fold8_ymx)
+        drv.memcpy_htod(self.fold8_t_gpu, fold8_t)
+
+        drv.memcpy_htod(self.random_x_seed_table_gpu, self.np_random_x_seed_table)
+
+        drv.memcpy_htod(self.full_haystack, self.target_list)
+        drv.memcpy_htod(self.bsearch_haystack_low, self.target_list_low)
+        drv.memcpy_htod(self.bsearch_haystack_high, self.target_list_high)
+
+        # MEMSET 0
+        drv.memset_d8(self.data_out_xy_gpu, 0, self.global_size*4*32)
+        drv.memset_d8(self.data_in_z_gpu, 0, self.global_size*32)
+        drv.memset_d8(self.data_w_gpu, 0, self.global_size*32)
+
+        drv.memset_d8(self.data_in_xmy_gpu, 0, self.blocks*32)
+        drv.memset_d8(self.data_in_xpy_gpu, 0, self.blocks*32)
+        drv.memset_d8(self.data_in_t_gpu, 0, self.blocks*32)
+
+        drv.memset_d8(self.bloom_filter_gpu, 0, self.bloom_filter_size // 8)
+
+        # VARIABLES
+        drv.memcpy_htod(self.found_flag_gpu, self.found_flag)
+
+        self.scalarmult_b_time = self.func_scalarmult_b.prepared_timed_call(
+                self.grid_scalarmult, self.block_scalarmult,
+                self.fold8_ypx_gpu,
+                self.fold8_ymx_gpu,
+                self.fold8_t_gpu,
+                self.data_in_xmy_gpu,
+                self.data_in_xpy_gpu,
+                self.data_in_t_gpu,
+                self.random_x_seed_table_gpu)()
+
+        self.func_bloom_filter_init.prepared_timed_call(
+                (1, 1), (1, 1, 1),
+                self.bsearch_haystack_low,
+                self.bsearch_haystack_high,
+                self.bloom_filter_gpu
+        )()
+
+    def run(self):
+        self.ctx.push()
+
+        stop = False
+
+        while not stop:
+            for iter_count in range(rekey + 1):
+                iter_time = time.time()
+                self.start_event.record(self.stream)
+
+                # Group addition step 0
+                self.func_batch_ge_add_step1.prepared_async_call(
+                    self.grid, self.block, self.stream,
+                    self.const_b_table_t_gpu,
+                    self.data_in_t_gpu,
+                    self.data_out_xy_gpu,
+                    self.data_in_z_gpu,
+                    self.data_w_gpu)
+
+                # Group addition step 1
+                self.func_batch_ge_add_step0.prepared_async_call(
+                    self.grid_2, self.block, self.stream,
+                    self.const_b_table_xpy_gpu,
+                    self.const_b_table_xmy_gpu,
+                    self.const_b_table_t_gpu,
+                    self.data_in_xmy_gpu,
+                    self.data_in_xpy_gpu,
+                    self.data_in_t_gpu,
+                    self.data_out_xy_gpu,
+                    self.data_w_gpu)
+
+                # Batched group inversion step 0
+                self.func_batch_inv_step0.prepared_async_call(
+                    self.grid256, self.block, self.stream,
+                    self.data_in_z_gpu,
+                    self.data_w_gpu)
+
+                # Batched group inversion step 1
+                self.func_batch_inv_step1.prepared_async_call(
+                    self.grid256, self.block, self.stream,
+                    self.data_w_gpu)
+
+                # Batched group inversion step 2
+                self.func_batch_inv_step2.prepared_async_call(
+                    self.grid256, self.block, self.stream,
+                    self.data_in_z_gpu,
+                    self.data_in_z_gpu,
+                    self.data_w_gpu)
+
+                # Calculate next optimized point
+                self.func_calc_next_point.prepared_async_call(
+                    self.grid256, self.block, self.stream,
+                    self.data_in_xmy_gpu,
+                    self.data_in_xpy_gpu,
+                    self.data_in_t_gpu,
+                    self.data_out_xy_gpu,
+                    self.data_in_z_gpu)
+
+                # SHA256 -> Bloom filter -> Binary search
+                self.func_sha256_quad.prepared_async_call(
+                    self.gridsha256, self.block, self.stream,
+                    self.data_out_xy_gpu,
+                    self.data_w_gpu,
+                    self.data_in_z_gpu,
+                    self.bloom_filter_gpu,
+                    self.bsearch_haystack_high,
+                    self.bsearch_haystack_low,
+                    self.full_haystack,
+                    self.found_flag_gpu)
+
+                # Get result
+                drv.memcpy_dtoh_async(self.found_flag, self.found_flag_gpu, self.stream)
+
+                self.end_event.record(self.stream)
+
+                self.stream.synchronize()
+                self.end_event.synchronize()
+
+                dur = self.start_event.time_till(self.end_event)
+
+                if self.found_flag[0] != -1:
+                    self.debug_test_found = test_found(f"GPU #{self.gpu_id}, Thread {self.tid}, {self.dev.name()}", self.found_flag, iter_count, self.n_batch, self.y_seed_table, self.blocks, self.random_x_seed_table, self.balances, args.output_filename, debug_test, self.target_list)
+
+                    self.found_flag[0] = -1
+                    drv.memcpy_htod(self.found_flag_gpu, self.found_flag)
+
+                iter_time = time.time() - iter_time
+
+                self.total_time += iter_time
+                self.total_iter_time += iter_time
+                self.total_gpu_time += dur
+
+                if (time.time()-self.output_stats_time)>output_stats_sec and self.total_iter_count>0:
+                    if self.stopped():
+                        stop = True
+                        break
+
+                    since_last = self.total_iter_count-self.last_iter_count
+                    self.last_stats_str = f"[GPU #{self.gpu_id}, {self.dev.name()}|Iter #{self.total_iter_count}|Speed {round(((self.global_size*16 * since_last) / self.total_time) / 1000000, 2)} MH/s|{round((self.total_gpu_time/since_last), 2)}/{round((self.total_iter_time/since_last) * 1000, 2)} ms/iter]"
+                    self.last_hashrate = ((self.global_size*16 * since_last) / self.total_time) / 1000000
+                    self.output_stats_time = time.time()
+                    self.last_iter_count = self.total_iter_count
+                    self.total_time = 0
+                    self.total_iter_time = 0
+                    self.total_gpu_time = 0
+
+                self.total_iter_count +=1
+
+            if not stop:
+                # Rekey
+                self.gpu_init()
+
+        self.gpu_cleanup()
+
+    def gpu_cleanup(self):
+        self.ctx.synchronize()
+
+        if profiling_enabled:
+            drv.stop_profiler()
+
+        self.ctx.pop()
+
+        self.fold8_ypx_gpu.free()
+        self.fold8_ymx_gpu.free()
+        self.fold8_t_gpu.free()
+
+        self.const_b_table_xmy_gpu.free()
+        self.const_b_table_xpy_gpu.free()
+        self.const_b_table_t_gpu.free()
+
+        self.full_haystack.free()
+        self.bloom_filter_gpu.free()
+        self.bsearch_haystack_low.free()
+        self.bsearch_haystack_high.free()
+
+        self.data_out_xy_gpu.free()
+        self.data_in_z_gpu.free()
+        self.data_w_gpu.free()
+        self.found_flag_gpu.free()
+
+        self.data_in_xmy_gpu.free()
+        self.data_in_xpy_gpu.free()
+        self.data_in_t_gpu.free()
+
+        self.random_x_seed_table_gpu.free()
+
+    def stop(self):
+        self.ctx.pop()
+        self._stop_event.set()
+
+    def stopped(self):
+        return self._stop_event.is_set()
+
+def str2bool(v):
+    if isinstance(v, bool):
+       return v
+    if v.lower() in ('yes', 'true', 't', 'y', '1'):
+        return True
+    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
+        return False
+    else:
+        raise argparse.ArgumentTypeError('Boolean value expected.')
+
+if __name__ == '__main__':
+    print("current python version (tested on 3.8.5): %s" % sys.version)
+    print("current pycuda version (tested on 2020.1): %s" % pycuda.VERSION_TEXT)
+
+    drv.init()
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--gpu-idxs', dest="gpu_idxs", default="0", help="Run on specified gpus idxs separated by comma. Default: 0")
+    parser.add_argument('--input-targets-file', dest="list_filename", default="list_01.txt", help="CSV list of targets, comma delimiter, target in row 1. Default: list_01.txt")
+    parser.add_argument('--n-targets', dest="n_target", type=int, default=5000, help="Number of targets to search, recommended below 10000 for better performance. Default: 5000")
+    parser.add_argument('--output-results-file', dest="output_filename", default="results.txt", help="Write found targets to this file. Default: results.txt")
+    parser.add_argument('--test-mode', dest="debug_test", type=str2bool, default=False, help="Enable test mode (crash if there is a calculation error). Default: False")
+    parser.add_argument('--batch-sizes', dest="n_batchs", default='512', help="batch size per gpu separated by comma, lower to use less ram/vram but degrade performance. Default: 512")
+
+    args = parser.parse_args()
+
+    if args.debug_test:
+        print("Warning : TEST MODE ACTIVATED. " + args.list_filename + " unused !")
+
+    if args.n_target>50000:
+        print("Warning : very high --n-targets value, performance degraded")
+
+    gpu_idxs = args.gpu_idxs
+    if ',' in gpu_idxs:
+        gpu_idxs = [int(x) for x in gpu_idxs.split(',')]
+    else:
+        gpu_idxs = [int(gpu_idxs)]
+
+    n_batchs = args.n_batchs
+    if ',' in n_batchs:
+        n_batchs = [int(x) for x in n_batchs.split(',')]
+    else:
+        n_batchs = [int(n_batchs)]
+
+    while len(n_batchs) < len(gpu_idxs):
+        n_batchs.append(512)
+
+    for n_batch in n_batchs:
+        if n_batch not in [16, 32, 64, 128, 256, 512]:
+            print()
+            print(f"Error : Invalid batch size {n_batch}, valid batch sizes : [16, 32, 64, 128, 256, 512]")
+            exit()
+
+    list_filename = args.list_filename
+    debug_test = args.debug_test
+    output_stats_sec = 5 # OUTPUT STATS EVERY N SECONDS
+    profiling_enabled = False
+    cubin_cache = True  # SAVE COMPILED KERNELS TO DISK
+
+    # BLOOM FILTER CONFIG
+    bloom_filter_k_hash = 5
+    bloom_filter_p = 1.0e-10
+    target_n = args.n_target
+
+    target_list = load_list(list_filename, target_n)
+    balances = load_balances(list_filename, target_n)
+
+    bloom_filter_size = next_prime(math.ceil(target_list.size * (-bloom_filter_k_hash / math.log(1 - math.exp(math.log(bloom_filter_p) / bloom_filter_k_hash)))))
+
+    # CHOOSE MODE (REAL/DEMO)
+    rekey = 1000
+    if debug_test:
+        rekey = 100
+
+    print("LIST OF AVAILABLE CUDA DEVICES :")
+    for i in range(drv.Device.count()):
+        dev_info = drv.Device(i)
+        print(" -GPU IDX: %d, %s" % (i, dev_info.name()))
+        print("   Compute Capability: %d.%d" % dev_info.compute_capability())
+        print("   Total Memory: %s KB" % (dev_info.total_memory() // (1024)))
+        print("   MULTIPROCESSOR_COUNT: %d" % (dev_info.get_attribute(drv.device_attribute.MULTIPROCESSOR_COUNT)))
+        print("   WARP_SIZE: %d" % (dev_info.get_attribute(drv.device_attribute.WARP_SIZE)))
+
+    print()
+
+    available_idxs = [int(x) for x in range(drv.Device.count())]
+    for gpu_idx in gpu_idxs:
+        if gpu_idx not in available_idxs:
+            print()
+            print(f"Error : Invalid gpu_idx {gpu_idx}")
+            exit()
+
+    output_stats_time = time.time()
+
+    gpu_thread_list = []
+    for idx, gpu_idx in enumerate(gpu_idxs):
+        gpu_thread = GPUThread(gpu_idx, n_batchs[idx], idx)
+        gpu_thread.gpu_init()
+        gpu_thread_list.append(gpu_thread)
+
+    try:
+        for gpu_idx in range(len(gpu_idxs)):
+            gpu_thread_list[gpu_idx].start()
+
+        done = False
+        while not done:
+            for gpu_idx in range(len(gpu_idxs)):
+                if not gpu_thread_list[gpu_idx].is_alive():
+                    done = True
+
+            time.sleep(1)
+            if (time.time()-output_stats_time)>output_stats_sec:
+                out_str = ''
+                total_speed = 0
+                for gpu_idx in range(len(gpu_idxs)):
+                    total_speed += gpu_thread_list[gpu_idx].last_hashrate
+
+                    if gpu_thread_list[gpu_idx].last_stats_str != '':
+                        out_str += gpu_thread_list[gpu_idx].last_stats_str
+                        out_str += '\n'
+                out_str += f"[Total speed {round(total_speed, 2)} MH/s]  "
+                print(out_str)
+                output_stats_time = time.time()
+
+        for gpu_idx in range(len(gpu_idxs)):
+            gpu_thread_list[gpu_idx].join()
 
         print()
-        total_computed = 0
-        loop_count_1 = 1
-        loop_count = 1
-        inc_count = 0
-        if debug_test:
-            debug_test_found = 0
-
-        for x in range(0, n_loop):
-            if ((x%regen_sk)==0) and (x>0):
-                print("-- Regen sk and pk --")
-                # GENERATE SECRET KEYS AND PUBLIC KEYS
-                random_sk_array = []
-                for i in range(blocks):
-                    random_sk = (secrets.randbelow(2**245) * 8)
-                    random_sk_array.append(random_sk)
-                    np_random_sk_array[i] = int_to_nparray32(random_sk)
-
-                # GENERATE OF TESTING PARAMETERS
-                if debug_test:
-                    if debug_test_found == 0:
-                        print("ERROR NOT FOUND\n")
-                        break
-                    debug_test_found = 0
-
-                    address_list = debug_generate(blocks, n_batch, regen_sk, B_mult_table_sk, random_sk_array, n_address_list, address_list_orig)
-
-                full_haystack = drv.mem_alloc(address_list.nbytes)
-                drv.memcpy_htod(full_haystack, address_list)
-                
-                address_list2 = address_list.view(dtype=np.dtype([('f1', np.uint32), ('f2', np.uint32)]))
-
-                address_list4 = []
-                address_list3 = []
-                for address_conv in address_list2:
-                    address_list3.append([address_conv[0][1]])
-                    address_list4.append([address_conv[0][0]])
-
-                address_list3 = np.asarray(address_list3, dtype="uint32")
-                address_list4 = np.asarray(address_list4, dtype="uint32")
-
-                drv.memcpy_htod(bsearch_haystack, address_list4)
-                drv.memcpy_htod(bsearch_haystack2, address_list3)
-
-                bloom_filter = np.zeros(bloom_filter_size//8, dtype="uint8")
-                bloom_filter_gpu = drv.mem_alloc(bloom_filter.nbytes)
-                drv.memcpy_htod(bloom_filter_gpu, bloom_filter)
-
-                func_bloom_filter_init.prepared_timed_call(
-                        (1, 1), (1, 1, 1),
-                        bsearch_haystack2,
-                        bsearch_haystack,
-                        bloom_filter_gpu
-                )()
-
-                # CONSTANT
-                drv.memcpy_htod(const_b_table_xmy_gpu, B_mult_table_xmy)
-                drv.memcpy_htod(const_b_table_xpy_gpu, B_mult_table_xpy)
-                drv.memcpy_htod(const_b_table_t_gpu, B_mult_table_t2d)
-
-                # MEMSET 0
-                drv.memset_d8(data_out_xy_gpu, 0, data_out_xy.nbytes)
-                drv.memset_d8(data_in_z_gpu, 0, data_in_z.nbytes)
-                drv.memset_d8(data_w_gpu, 0, data_w.nbytes)
-
-                # VARIABLES
-                drv.memcpy_htod(data_in_xmy_gpu, data_in_xmy)
-                drv.memcpy_htod(data_in_xpy_gpu, data_in_xpy)
-                drv.memcpy_htod(data_in_t_gpu, data_in_t)
-
-                drv.memcpy_htod(fold8_ypx_gpu, fold8_ypx)
-                drv.memcpy_htod(fold8_ymx_gpu, fold8_ymx)
-                drv.memcpy_htod(fold8_t_gpu, fold8_t)
-
-                # set found flag to -1
-                drv.memcpy_htod(found_flag_gpu, found_flag)
-
-                drv.memcpy_htod(np_random_sk_array_gpu, np_random_sk_array)
-
-                elapsed_time_1 = func_scalarmult_b.prepared_timed_call(
-                        grid_scalarmult, block_scalarmult,
-                        fold8_ypx_gpu,
-                        fold8_ymx_gpu,
-                        fold8_t_gpu,
-                        data_in_xmy_gpu, 
-                        data_in_xpy_gpu, 
-                        data_in_t_gpu,
-                        np_random_sk_array_gpu)()
-
-                inc_count = 0
-
-            start_event.record(stream)
-
-            # Batched ge addition 1
-            func_batch_ge_add_step1.prepared_async_call(
-                grid, block, stream,
-                const_b_table_t_gpu,
-                data_in_t_gpu, 
-                data_out_xy_gpu, 
-                data_in_z_gpu,
-                data_w_gpu)
-
-            # Batched ge addition 0
-            func_batch_ge_add_step0.prepared_async_call(
-                grid_2, block, stream,
-                const_b_table_xpy_gpu,
-                const_b_table_xmy_gpu,
-                const_b_table_t_gpu,
-                data_in_xmy_gpu, 
-                data_in_xpy_gpu,
-                data_in_t_gpu, 
-                data_out_xy_gpu,
-                data_w_gpu)
-
-            # Batched inversion step 0
-            func_batch_inv_step0.prepared_async_call(
-                grid256, block, stream,
-                data_in_z_gpu, 
-                data_w_gpu)
-
-            # Batched inversion step 1
-            func_batch_inv_step1.prepared_async_call(
-                grid256, block, stream,
-                data_w_gpu)
-
-            # Batched inversion step 2
-            func_batch_inv_step2.prepared_async_call(
-                grid256, block, stream,
-                data_in_z_gpu, 
-                data_in_z_gpu, 
-                data_w_gpu)
-
-            # Calculate next optimized point
-            func_calc_next_point.prepared_async_call(
-                grid256_2, block, stream,
-                data_in_xmy_gpu, 
-                data_in_xpy_gpu, 
-                data_in_t_gpu, 
-                data_out_xy_gpu,
-                data_in_z_gpu)
-
-            # Sha256 X4
-            func_sha256_quad.prepared_async_call(
-                gridsha256, block, stream,
-                data_out_xy_gpu, 
-                data_w_gpu,
-                data_in_z_gpu,
-                bloom_filter_gpu,
-                bsearch_haystack,
-                bsearch_haystack2,
-                full_haystack,
-                found_flag_gpu)
-
-            # Get result
-            drv.memcpy_dtoh_async(found_flag, found_flag_gpu, stream)
-
-            end_event.record(stream)
-
-            stream.synchronize()
-            end_event.synchronize()
-
-            elapsed_time += start_event.time_till(end_event)
-
-            if found_flag[0] != -1:
-                print("found_flag activated... Checking...")
-                found_flag_i = found_flag[0]>>1
-                increment_ff = math.floor(((found_flag_i) % (n_batch)))
-                increment_1 =     B_mult_table_sk[increment_ff] + inc_count * B_mult_table_sk[(n_batch-1)]
-                increment_2 = l - B_mult_table_sk[increment_ff] + inc_count * B_mult_table_sk[(n_batch-1)]
-
-
-                c_id1 = (found_flag_i) - (blocks * n_batch);
-                c_id2 = (found_flag_i) - (blocks * n_batch)*2;
-                c_id3 = (found_flag_i) - (blocks * n_batch)*3;
-
-                cid_1 = ((found_flag_i) < (blocks * n_batch));
-                cid_2 = ((found_flag_i) < (blocks * n_batch)*2);
-                cid_3 = ((found_flag_i) < (blocks * n_batch)*3);
-
-                c_id_array = [(found_flag_i-increment_ff)//n_batch, (c_id1-increment_ff)//n_batch, (c_id2-increment_ff)//n_batch, (c_id3-increment_ff)//n_batch]
-                for sk_index in c_id_array:
-                    if sk_index < len(random_sk_array):
-                        sk_index = math.floor(sk_index)
-
-                        found_sk_orig = random_sk_array[sk_index]
-                        found_sk_hex = int_to_hex(found_sk_orig)
-
-                        found_sk_1 = found_sk_orig + increment_1
-                        found_sk_2 = found_sk_orig + increment_2
-
-                        found_sk_hex_calc_1 = int_to_hex(found_sk_1)
-                        found_sk_hex_calc_2 = int_to_hex(found_sk_2)
-
-                        found_pks_1 = privatetopublickey(found_sk_1)
-                        found_pks_2 = privatetopublickey(found_sk_2)
-
-                        found_pk = 0
-                        select_address = 0
-                        found = 0
-
-                        for pk in found_pks_1: 
-                            if np.isin(int(liskpktoaddr(pk)), address_list):
-                                found_pk = pk
-                                select_address = str(int(liskpktoaddr(pk)))
-                                found_sk_hex_calc = found_sk_hex_calc_1
-                                increment = increment_1
-                                found = 1
-
-                        for pk in found_pks_2: 
-                            if np.isin(int(liskpktoaddr(pk)), address_list):
-                                found_pk = pk
-                                select_address = str(int(liskpktoaddr(pk)))
-                                found_sk_hex_calc = found_sk_hex_calc_2
-                                increment = increment_2
-                                found = 1
-
-                        if found:
-                            balance = 0
-                            for address_balance in balances:
-                        	    if str(select_address) == str(address_balance[0]):
-                        	        balance = address_balance[1]
-
-                            print("Target found at gid : " + str(found_flag[0]) + " / loop " + str(inc_count) + " / sk index " + str(sk_index))
-                            print("Original sk : " + str(found_sk_hex))
-                            print("Calculated sk / increment : " + str(found_sk_hex_calc) + " / " + str(increment)) 
-                            print("Calculated pk : " + str(found_pk))
-                            print("Balance : " + str(balance))
-                            print("Target : " + str(select_address) + "L")
-                            print(str(select_address) + "L," + str(found_pk.decode('utf-8')) + "," + str(found_sk_hex_calc.decode('utf-8')))
-                            print()
-
-                            if debug_test == False:
-                                res_file = open(str(args.output_filename),"a+") 
-                                res_file.write(str(select_address) + "L," + str(found_pk.decode('utf-8')) + "," + str(found_sk_hex_calc.decode('utf-8')) + "," + str(balance) + "\n") 
-                                res_file.close() 
-
-
-                            if debug_test:
-                                debug_test_found = 1
-
-                            found_flag[0] = -1
-                            drv.memcpy_htod(found_flag_gpu, found_flag)
-                            break
-
-            if ((x%output_stats)==0) and (x>0):
-                n_generated = global_size*16*loop_count_1
-                print("Iteration #%d | Hashrate : %s MH/s" % (loop_count-1, str((n_generated/elapsed_time)/1000)))
-                elapsed_time = 0
-                loop_count_1 = 0
-
-            total_computed += global_size*16
-            loop_count_1 +=1
-            loop_count += 1
-            inc_count += 1
 
     except KeyboardInterrupt:
-        print("Shutdown requested...exiting")
+        for gpu_idx in range(len(gpu_idxs)):
+            gpu_thread_list[gpu_idx].stop()
+        print("\nShutdown requested...exiting")
     except:
         print("Unexpected error...exiting")
         raise
-    print()
-
-    ctx.synchronize()
-    if profiling_enabled:
-        drv.stop_profiler()
-    ctx.pop()
-    del ctx
-
-    # FREE GPU buffers
-    # CONSTANT
-    const_b_table_xmy_gpu.free()
-    const_b_table_xpy_gpu.free()
-    const_b_table_t_gpu.free()
-
-    bsearch_haystack.free()
-    bloom_filter_gpu.free()
-    bsearch_haystack2.free()
-    # MEMSET 0
-    data_out_xy_gpu.free()
-    data_in_z_gpu.free()
-    data_w_gpu.free()
-    found_flag_gpu.free()
-
-    # VARIABLES
-    data_in_xmy_gpu.free()
-    data_in_xpy_gpu.free()
-    data_in_t_gpu.free()
-
-    print("Register usage per kernels")
-    print_reg(func_scalarmult_b, 'func_scalarmult_b')
-    print_reg(func_batch_ge_add_step0, 'func_batch_ge_add_step0')
-    print_reg(func_batch_ge_add_step1, 'func_batch_ge_add_step1')
-    print_reg(func_batch_inv_step0, 'func_batch_inv_step0')
-    print_reg(func_batch_inv_step1, 'func_batch_inv_step1')
-    print_reg(func_batch_inv_step2, 'func_batch_inv_step2')
-    print_reg(func_calc_next_point, 'func_calc_next_point')
-    print_reg(func_sha256_quad, 'func_sha256_quad')
-
-if __name__ == "__main__":
-    from lib_ed import *
-    main()
