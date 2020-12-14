@@ -95,8 +95,10 @@ class GPUThread(threading.Thread):
         nvcc_options = ['-use_fast_math', '--generate-line-info']
         nvcc_include_dirs = [os.path.realpath("") + "/inc_cu"]
 
-        self.ctx = self.dev.retain_primary_context()
-        self.ctx.push()
+        #self.ctx = self.dev.retain_primary_context()
+        #self.ctx.push()
+        
+        self.ctx = self.dev.make_context()
 
         if profiling_enabled:
             drv.start_profiler()
