@@ -98,7 +98,7 @@ class GPUThread(threading.Thread):
         #self.ctx = self.dev.retain_primary_context()
         #self.ctx.push()
         
-        self.ctx = self.dev.make_context()
+        self.ctx = self.dev.make_context(drv.ctx_flags.SCHED_BLOCKING_SYNC)
 
         if profiling_enabled:
             drv.start_profiler()
