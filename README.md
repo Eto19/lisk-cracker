@@ -10,6 +10,8 @@ It only work on uninitialized lisk addresses.
 
 Multi-GPU isn't supported. To use multiple GPUs you must run multiple instances of the program (1 per GPUs).
 
+Multi-GPU version : https://github.com/Eto19/lisk-cracker/tree/multigpu
+
 ## Initialize your lisk address, secure your funds !
 * https://www.lisk.support/lisk-support/initialize-your-address/
 * https://medium.com/@simonwarta/economics-of-stealing-uninitialized-lisk-accounts-9a6c2529cbd4
