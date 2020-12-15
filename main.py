@@ -50,7 +50,7 @@ class GPUThread(threading.Thread):
         self.tid = tid
         self.n_batch = batch_size
 
-        self.dev = drv.Device(gpu_idx)
+        self.dev = drv.Device(self.gpu_id)
         self.blocks = self.dev.get_attribute(drv.device_attribute.MULTIPROCESSOR_COUNT) * 8 * 64
 
         self.grid = (self.blocks, 1)
